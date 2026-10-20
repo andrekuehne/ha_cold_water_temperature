@@ -29,13 +29,17 @@ template:
         \ 0) <= s.c[4] }}"
       last_observed_at: '{% set s = states(helper_entity) | from_json(default={}) %} {{ as_datetime(s.r).isoformat()
         if s is mapping and s.get(''r'', 0) > 0 else none }}'
-      status: "{% set s = states(helper_entity) | from_json(default={}) %} {% if s is not mapping or s.get('b',\
-        \ 0) == 0 or s.get('c', []) | length < 5 %}\n  waiting_for_data\n{% elif as_timestamp(now()) -\
-        \ s.get('r', 0) > s.c[4] %}\n  waiting_for_data\n{% elif s.get('f', 0) == 0 or as_timestamp(now())\
-        \ - s.f > s.c[3] %}\n  idle\n{% elif s.get('l', 0) < s.c[0] %}\n  flushing\n{% else %}\n  sampling\n\
-        {% endif %}"
+      status: "{% set s = states(helper_entity) | from_json(default={}) %}\n{% if s is not mapping or\
+        \ s.get('b', 0) == 0 or s.get('c', []) | length < 5 %}\n  waiting_for_data\n{% elif as_timestamp(now())\
+        \ - s.get('r', 0) > s.c[4] %}\n  waiting_for_data\n{% elif s.get('h', 0) > 0 %}\n  guarding\n\
+        {% elif s.get('f', 0) == 0 or as_timestamp(now()) - s.f > s.c[3] %}\n  idle\n{% elif s.get('l',\
+        \ 0) < s.c[0] %}\n  flushing\n{% else %}\n  sampling\n{% endif %}"
       flushed_litres: '{% set s = states(helper_entity) | from_json(default={}) %} {{ s.get(''l'', 0)
         if s is mapping else 0 }}'
+      long_idle_guard: '{% set s = states(helper_entity) | from_json(default={}) %} {{ s is mapping and
+        s.get(''h'', 0) > 0 }}'
+      last_flow_at: '{% set s = states(helper_entity) | from_json(default={}) %} {{ as_datetime(s.f).isoformat()
+        if s is mapping and s.get(''f'', 0) > 0 else none }}'
     unique_id: incoming_water_temperature
   - name: Incoming water temperature today
     device_class: temperature

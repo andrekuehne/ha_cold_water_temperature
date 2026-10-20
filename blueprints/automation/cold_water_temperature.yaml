@@ -7,7 +7,7 @@ blueprint:
     input_text helper (maximum length 255) for all persistent state. Create
     the two display sensors with the companion package or template blueprints. Temperatures
     must be in °C; configure the conversion from the cumulative meter to litres.
-    Use a dedicated helper for each automation instance. Version 1.1.0.
+    Use a dedicated helper for each automation instance. Version 1.2.0.
   domain: automation
   author: Andre Kuehne
   source_url: https://github.com/andrekuehne/ha_cold_water_temperature/blob/main/blueprints/automation/cold_water_temperature.yaml
@@ -106,6 +106,44 @@ blueprint:
           default: 90
           selector:
             number: {min: 10, max: 600, step: 1, unit_of_measurement: s, mode: box}
+    long_idle_guard:
+      name: Long-idle guard
+      collapsed: true
+      input:
+        long_idle_hours:
+          name: Arm after no water use
+          description: >-
+            Hours since the last positive volume increase. Set 0 to disable.
+            Unknown flow history starts guarded. Small draws do not disarm it.
+          default: 3
+          selector:
+            number: {min: 0, max: 168, step: 0.5, unit_of_measurement: h, mode: box}
+        guarded_flush_litres:
+          name: Guarded flush volume
+          description: >-
+            Required volume within one water-use session while guarded.
+            The effective threshold is never lower than the normal flush volume.
+          default: 10
+          selector:
+            number: {min: 0, max: 500, step: 0.1, unit_of_measurement: L, mode: box}
+        guarded_delay:
+          name: Exclude initial readings for
+          description: >-
+            Seconds from the first volume increase of the guarded session.
+            A subsequent volume increase at or after this delay must arrive
+            before a confirmation window can open. Waiting alone cannot qualify.
+          default: 120
+          selector:
+            number: {min: 0, max: 1800, step: 1, unit_of_measurement: s, mode: box}
+        guarded_confirmation_span:
+          name: Guarded confirmation time
+          description: >-
+            Stable fresh-observation span after the guarded volume/time gates.
+            Strict mode uses at least its own minimum span. Keep shorter than
+            the flow pause so a completed draw can still be confirmed.
+          default: 30
+          selector:
+            number: {min: 10, max: 600, step: 1, unit_of_measurement: s, mode: box}
     timing:
       name: Pauses, missing data and freshness
       collapsed: true
@@ -179,6 +217,10 @@ actions:
       fresh_hours: !input freshness_hours
       sampling_mode: !input sampling_mode
       confirmation_span: !input confirmation_span
+      idle_hours: !input long_idle_hours
+      guarded_flush: !input guarded_flush_litres
+      guarded_wait: !input guarded_delay
+      guarded_span: !input guarded_confirmation_span
       event_kind: >-
         {{ 'reset' if trigger is not defined else
            'invalid' if trigger.platform | default('') == 'state'
@@ -196,9 +238,15 @@ actions:
         {% set day = now().strftime('%Y%m%d') | int %}
         {% set raw = states(helper_entity) | from_json(default={}) %}
         {% set old = raw if raw is mapping and raw.get('v') == 1 else {} %}
-        {% set cfg = [flush | float, tolerance | float, span | int,
+        {% set settings = [flush | float, tolerance | float, span | int,
                       pause | int, timeout | int, fresh_hours | float, volume_factor | float,
-                      confirmation_span | int if sampling_mode == 'batch' else 0] %}
+                      confirmation_span | int if sampling_mode == 'batch' else 0,
+                      idle_hours | float, guarded_flush | float, guarded_wait | int, guarded_span | int] %}
+        {% set packed = namespace(c=[]) %}
+        {% for value in settings %}
+          {% set packed.c = packed.c + [value | int if value == value | int else value] %}
+        {% endfor %}
+        {% set cfg = packed.c %}
         {% set a = old.get('a', []) %}
         {% if a is not sequence or a is string or a | length != 2
               or not is_number(a[0]) or not is_number(a[1]) %}{% set a = [] %}{% endif %}
@@ -214,13 +262,15 @@ actions:
             {% if q0 | length == 6 and is_number(q0[0]) and is_number(q0[1])
                   and is_number(q0[2]) and is_number(q0[3])
                   and is_number(q0[4]) and is_number(q0[5]) %}
-              {% set checked.q = q0 %}
+              {% set base = old.get('f', 0) | int if 'h' in old else 0 %}
+              {% set checked.q = [q0[0] + base, q0[1], q0[2] + base, q0[3], q0[4], q0[5]] %}
             {% endif %}
           {% else %}
             {% for pair in q0[-3:] %}
               {% if pair is sequence and pair is not string and pair | length == 2
                     and is_number(pair[0]) and is_number(pair[1]) %}
-                {% set checked.q = checked.q + [[pair[0] | int, pair[1] | float]] %}
+                {% set base = old.get('f', 0) | int if 'h' in old else 0 %}
+                {% set checked.q = checked.q + [[(pair[0] | int) + base, pair[1] | float]] %}
               {% endif %}
             {% endfor %}
           {% endif %}
@@ -228,7 +278,14 @@ actions:
         {% set s = namespace(p=old.get('p', 0) | float(0), r=old.get('r', 0) | int(0),
              f=old.get('f', 0) | int(0), l=old.get('l', 0) | float(0),
              b=old.get('b', 0) | int(0), z=old.get('z', 0) | int(0),
+             h=old.get('h', 1 if idle_hours | float > 0 else 0) | int(1),
              q=checked.q, a=a, d=d, accepted=none, accepted_at=0) %}
+        {# h: 0=unguarded, 1=armed, >1=first flow time of guarded session. #}
+        {% if idle_hours | float <= 0 %}
+          {% set s.h = 0 %}
+        {% elif s.h == 0 and (s.f <= 0 or now_s - s.f >= idle_hours | float * 3600) %}
+          {% set s.h = 1 %}{% set s.q = [] %}
+        {% endif %}
         {% set temp = states(temperature_entity) %}
         {% set volume = states(volume_entity) %}
         {% set t_state = states[temperature_entity] %}
@@ -250,6 +307,7 @@ actions:
         {% if restart or not available or gap %}
           {% if s.b or restart %}{% set s.z = now_s %}{% endif %}
           {% set s.b = 0 %}{% set s.f = 0 %}{% set s.l = 0 %}{% set s.q = [] %}
+          {% if idle_hours | float > 0 %}{% set s.h = 1 %}{% endif %}
           {% set s.r = 0 %}
         {% endif %}
         {% if available and not restart %}
@@ -267,23 +325,29 @@ actions:
             {% if delta < 0 %}
               {# Counter reset: this value is the new baseline, not negative flow. #}
               {% set s.f = 0 %}{% set s.l = 0 %}{% set s.q = [] %}
+              {% if idle_hours | float > 0 %}{% set s.h = 1 %}{% endif %}
             {% elif delta > 0 %}
               {% set flow_at = as_timestamp(v_state.last_updated, now_s) | int %}
               {% if s.f == 0 or flow_at - s.f > pause | int %}
                 {% set s.l = 0 %}{% set s.q = [] %}
+                {% if s.h > 0 %}{% set s.h = 1 %}{% endif %}
               {% endif %}
+              {% if s.h == 1 %}{% set s.h = flow_at %}{% endif %}
               {% set s.f = flow_at %}
               {% set s.l = (s.l + delta) | round(3) %}
-              {% if s.l >= flush | float %}
+              {% set required_flush = [flush | float, guarded_flush | float] | max if s.h > 0 else flush | float %}
+              {% set ready = s.h == 0 or flow_at - s.h >= guarded_wait | int %}
+              {% set strict_span = [span | int, guarded_span | int] | max if s.h > 0 else span | int %}
+              {% if s.l >= required_flush and ready %}
                 {% if sampling_mode == 'batch' %}
                   {# Only real volume increases may open a confirmation window. #}
                   {% if s.q | length == 0 %}
                     {% set value = temp | float | round(2) %}
                     {% set s.q = [flow_at, value, flow_at, 1, value, value] %}
                   {% endif %}
-                {% elif s.q | length == 0 or flow_at - s.q[-1][0] >= span | float / 2 %}
+                {% elif s.q | length == 0 or flow_at - s.q[-1][0] >= strict_span / 2 %}
                   {% set s.q = (s.q + [[flow_at, temp | float | round(2)]])[-3:] %}
-                  {% if s.q | length == 3 and s.q[-1][0] - s.q[0][0] >= span | int %}
+                  {% if s.q | length == 3 and s.q[-1][0] - s.q[0][0] >= strict_span %}
                     {% set values = s.q | map(attribute=1) | list | sort %}
                     {% if values[-1] - values[0] <= tolerance | float + 0.000001 %}
                       {% set s.accepted = values[1] %}{% set s.accepted_at = flow_at %}
@@ -294,15 +358,16 @@ actions:
             {% endif %}
             {% if sampling_mode == 'batch' and fresh_observation and s.q | length > 0
                   and s.f > 0 and 0 <= now_s - s.f <= pause | int %}
+              {% set confirm_for = guarded_span | int if s.h > 0 else confirmation_span | int %}
               {% set low = [s.q[4], temp | float | round(2)] | min %}
               {% set high = [s.q[5], temp | float | round(2)] | max %}
               {% set s.q = s.q[:4] + [low, high] %}
               {% if high - low > tolerance | float + 0.000001 %}
                 {# Do not slide a rejected window into a later idle plateau. #}
                 {% set s.q = [] %}
-              {% elif received - s.q[2] >= confirmation_span | float / 2 %}
+              {% elif received - s.q[2] >= confirm_for / 2 %}
                 {% set s.q = s.q[:2] + [received, s.q[3] | int + 1, low, high] %}
-                {% if s.q[3] >= 3 and received - s.q[0] >= confirmation_span | int %}
+                {% if s.q[3] >= 3 and received - s.q[0] >= confirm_for %}
                   {# Confirm the flow-linked reading; never publish a warmed idle sample. #}
                   {% set s.accepted = s.q[1] %}{% set s.accepted_at = s.q[0] %}
                   {% set s.q = [] %}
@@ -312,6 +377,7 @@ actions:
           {% endif %}
         {% endif %}
         {% if s.accepted is not none %}
+          {% set s.h = 0 %}
           {% set s.a = [s.accepted_at, s.accepted] %}
           {% if as_local(as_datetime(s.accepted_at)).strftime('%Y%m%d') | int == day %}
             {% set minimum = s.accepted if s.d[1] is none else [s.d[1], s.accepted] | min %}
@@ -319,10 +385,20 @@ actions:
           {% endif %}
         {% endif %}
         {% if s.f > 0 and now_s - s.f > pause | int %}
-          {% set s.f = 0 %}{% set s.l = 0 %}{% set s.q = [] %}
+          {% set s.l = 0 %}{% set s.q = [] %}
+          {% if s.h > 0 %}{% set s.h = 1 %}{% endif %}
+        {% endif %}
+        {# Store candidate times as offsets from persistent last-flow time to fit 255 characters. #}
+        {% set encoded_q = namespace(q=[]) %}
+        {% if s.q | length > 0 %}
+          {% if sampling_mode == 'batch' %}
+            {% set encoded_q.q = [s.q[0] - s.f, s.q[1], s.q[2] - s.f, s.q[3], s.q[4], s.q[5]] %}
+          {% else %}
+            {% for pair in s.q %}{% set encoded_q.q = encoded_q.q + [[pair[0] - s.f, pair[1]]] %}{% endfor %}
+          {% endif %}
         {% endif %}
         {{ {'v':1,'p':s.p,'r':s.r,'f':s.f,'l':s.l,'b':s.b,'z':s.z,
-            'q':s.q,'a':s.a,'d':s.d,'c':cfg} }}
+            'h':s.h,'q':encoded_q.q,'a':s.a,'d':s.d,'c':cfg} }}
   - variables:
       encoded_state: "{{ next_state | to_json | replace(', ', ',') | replace(': ', ':') }}"
   - if:

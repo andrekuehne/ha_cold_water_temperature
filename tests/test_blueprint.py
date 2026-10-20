@@ -65,7 +65,7 @@ class States:
 
 
 class Harness:
-    def __init__(self,heartbeat=True,mode='strict'):
+    def __init__(self,heartbeat=True,mode='strict',guard=False):
         self.t=int(datetime(2026,10,20,10,tzinfo=TZ).timestamp())
         self.states=States()
         self.states.set('input_text.state','',self.t)
@@ -75,7 +75,8 @@ class Harness:
         self.variables={'temperature_entity':'sensor.temperature','volume_entity':'sensor.volume',
                         'helper_entity':'input_text.state','receipt_entity':'sensor.received' if heartbeat else [],
                         'volume_factor':1000,'flush':5,'tolerance':.2,'span':90,'pause':150,'timeout':180,'fresh_hours':24,
-                        'sampling_mode':mode,'confirmation_span':30}
+                        'sampling_mode':mode,'confirmation_span':30,
+                        'idle_hours':3 if guard else 0,'guarded_flush':10,'guarded_wait':120,'guarded_span':30}
         self.env=NativeEnvironment(undefined=StrictUndefined)
         self.env.filters.update(from_json=from_json,to_json=lambda v: json.dumps(v,separators=(',',':')))
         self.env.globals.update(states=self.states,now=lambda:as_datetime(self.t).astimezone(TZ),
@@ -115,8 +116,178 @@ class Harness:
         self.advance(60,volume=1.008,temperature=13.8)
         return self.advance(60,volume=1.011,temperature=13.9)
 
+    def qualify_guard(self):
+        self.establish()
+        self.advance(60,volume=1.006,temperature=13.5)
+        self.advance(60,volume=1.010,temperature=13.6)
+        self.advance(60,volume=1.011,temperature=13.8)
+        self.advance(20,event='packet')
+        return self.advance(20,event='packet')
+
+    def idle_for(self,seconds):
+        while seconds > 0:
+            step=min(seconds,120)
+            self.advance(step,event='packet')
+            seconds-=step
+
 
 class BlueprintTests(unittest.TestCase):
+    def test_guard_excludes_cold_dip_and_needs_flow_after_wait(self):
+        h=Harness(mode='batch',guard=True);h.establish()
+        h.advance(60,volume=1.006,temperature=13.5)
+        h.advance(60,volume=1.010,temperature=13.6)
+        self.assertEqual(h.s['q'],[])
+        for _ in range(4):
+            h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+        self.assertEqual(h.s['d'][2],0)
+        h.advance(20,volume=1.012,temperature=13.8)
+        anchor=h.t
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[anchor,13.8])
+        self.assertEqual(h.s['d'],[20261020,13.8,1])
+        self.assertEqual(h.s['h'],0)
+
+    def test_guard_stays_armed_through_small_draws(self):
+        h=Harness(mode='batch',guard=True);h.establish()
+        h.advance(60,volume=1.002,temperature=13.5)
+        h.advance(160,event='packet')
+        self.assertEqual(h.s['h'],1)
+        h.advance(20,volume=1.010,temperature=13.5)
+        h.advance(60,volume=1.012,temperature=13.6)
+        self.assertEqual(h.s['a'],[])
+        self.assertEqual(h.s['q'],[])
+        h.advance(60,volume=1.013,temperature=13.8)
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'][1],13.8)
+        self.assertEqual(h.s['h'],0)
+
+    def test_guard_session_pause_resets_elapsed_time_and_volume(self):
+        h=Harness(mode='batch',guard=True);h.establish()
+        h.advance(60,volume=1.006,temperature=13.5)
+        h.advance(151,event='packet')
+        h.advance(20,volume=1.011,temperature=13.8)
+        self.assertEqual(h.s['l'],5)
+        self.assertEqual(h.s['h'],h.t)
+        h.advance(40,event='packet')
+        self.assertEqual(h.s['a'],[])
+
+    def test_guard_release_restores_normal_acceptance_for_later_draws(self):
+        h=Harness(mode='batch',guard=True);h.qualify_guard()
+        self.assertEqual(h.s['h'],0)
+        h.advance(160,event='packet')
+        last_flow=h.s['f']
+        self.assertGreater(last_flow,0)
+        h.advance(20,volume=1.016,temperature=14)
+        anchor=h.t
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[anchor,14])
+
+    def test_idle_guard_arms_at_configured_boundary_despite_healthy_packets(self):
+        h=Harness(mode='batch',guard=True);h.qualify_guard()
+        last_flow=h.s['f']
+        h.idle_for(last_flow+10800-1-h.t)
+        self.assertEqual(h.s['h'],0)
+        self.assertEqual(h.s['f'],last_flow)
+        self.assertEqual(h.s['b'],1)
+        h.advance(1,event='packet')
+        self.assertEqual(h.s['h'],1)
+        self.assertEqual(h.s['f'],last_flow)
+        h.advance(20,volume=1.016,temperature=13)
+        self.assertGreater(h.s['h'],1)
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'][1],13.8)
+
+    def test_all_guard_thresholds_are_configurable(self):
+        h=Harness(mode='batch',guard=True)
+        h.variables.update(idle_hours=1,guarded_flush=15,guarded_wait=180,guarded_span=60)
+        h.establish()
+        for seconds,volume in [(60,1.006),(60,1.012),(60,1.014)]:
+            h.advance(seconds,volume=volume,temperature=13.5)
+            self.assertEqual(h.s['q'],[])
+        h.advance(60,volume=1.015,temperature=14)
+        anchor=h.t
+        h.advance(30,event='packet')
+        self.assertEqual(h.s['a'],[])
+        h.advance(30,event='packet')
+        self.assertEqual(h.s['a'],[anchor,14])
+        last_flow=h.s['f']
+        h.idle_for(last_flow+3600-h.t)
+        self.assertEqual(h.s['h'],1)
+
+    def test_guard_can_be_disabled(self):
+        h=Harness(mode='batch',guard=True);h.variables['idle_hours']=0
+        h.establish();h.advance(60,volume=1.005,temperature=14)
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'][1],14)
+        self.assertEqual(h.s['h'],0)
+
+    def test_guard_never_reduces_normal_flush_requirement(self):
+        h=Harness(mode='batch',guard=True)
+        h.variables.update(flush=20,guarded_flush=10,guarded_wait=0)
+        h.establish();h.advance(60,volume=1.015,temperature=14)
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+        h.advance(20,volume=1.020,temperature=14)
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'][1],14)
+
+    def test_guard_works_with_strict_flow_samples(self):
+        h=Harness(guard=True);h.establish()
+        h.advance(60,volume=1.006,temperature=13.5)
+        h.advance(60,volume=1.010,temperature=13.6)
+        self.assertEqual(h.s['q'],[])
+        for volume in [1.011,1.012,1.013]:
+            h.advance(60,volume=volume,temperature=13.8)
+        self.assertEqual(h.s['a'][1],13.8)
+        self.assertEqual(h.s['h'],0)
+
+    def test_guard_restart_preserves_accepted_values_and_rearms(self):
+        h=Harness(mode='batch',guard=True);h.qualify_guard()
+        accepted=h.s['a'][:];daily=h.s['d'][:]
+        h.advance(1,event='reset')
+        self.assertEqual(h.s['h'],1)
+        self.assertEqual(h.s['a'],accepted)
+        self.assertEqual(h.s['d'],daily)
+        h.advance(20,volume=1.030,event='packet')
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],accepted)
+        self.assertEqual(h.s['l'],0)
+
+    def test_v11_migration_preserves_results_and_arms_guard(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.008,temperature=13.5)
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        legacy=h.s.copy();legacy.pop('h');legacy['c']=legacy['c'][:8]
+        h.states.set('input_text.state',json.dumps(legacy),h.t)
+        h.variables['idle_hours']=3
+        h.run('tick')
+        self.assertEqual(h.s['h'],1)
+        self.assertEqual(h.s['b'],0)
+        self.assertEqual(h.s['a'],legacy['a'])
+        self.assertEqual(h.s['d'],legacy['d'])
+
+    def test_guard_reception_gap_discards_jump_and_early_candidates(self):
+        h=Harness(mode='batch',guard=True);h.qualify_guard()
+        accepted=h.s['a'][:]
+        h.advance(181,volume=1.040,event='packet')
+        self.assertEqual(h.s['h'],1)
+        self.assertEqual(h.s['l'],0)
+        h.advance(20,volume=1.045,temperature=13)
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],accepted)
+
+    def test_guard_pending_state_with_accepted_value_fits_text_helper(self):
+        for mode in ['batch','strict']:
+            with self.subTest(mode=mode):
+                h=Harness(mode='batch',guard=True);h.qualify_guard()
+                h.variables['sampling_mode']=mode
+                h.run('reset');h.advance(20)
+                h.advance(60,volume=123456789.005,temperature=14)
+                for offset,temp in [(60,14),(60,14),(60,14.4),(60,14.8),(60,15.2)]:
+                    h.advance(offset,volume=float(h.states('sensor.volume'))+.005,temperature=temp)
+                self.assertLessEqual(len(h.encoded),255)
+
     def test_sources_are_entities_and_no_mqtt_dependency(self):
         serialized=json.dumps(AUTOMATION)
         self.assertNotIn('mqtt.publish',serialized)
