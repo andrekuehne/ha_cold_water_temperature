@@ -2,12 +2,12 @@ blueprint:
   name: Incoming water temperature — flow-qualified estimate
   description: >-
     Estimate incoming water temperature only after a configurable flush and a
-    stable window of water-use readings. Works with ordinary Home Assistant
+    stable confirmation window after a water-use report. Works with ordinary Home Assistant
     sensor entities from any integration; MQTT is not required. Uses one
     input_text helper (maximum length 255) for all persistent state. Create
     the two display sensors with the companion package or template blueprints. Temperatures
     must be in °C; configure the conversion from the cumulative meter to litres.
-    Use a dedicated helper for each automation instance. Version 1.0.0.
+    Use a dedicated helper for each automation instance. Version 1.1.0.
   domain: automation
   author: Andre Kuehne
   source_url: https://github.com/andrekuehne/ha_cold_water_temperature/blob/main/blueprints/automation/cold_water_temperature.yaml
@@ -65,20 +65,43 @@ blueprint:
     qualification:
       name: Measurement qualification
       input:
+        sampling_mode:
+          name: Meter reporting pattern
+          description: >-
+            Batched meters qualify a flushed reading using subsequent fresh
+            packets, even if volume stays unchanged. Strict mode requires three
+            separate volume increases after flushing, as in version 1.0.
+          default: batch
+          selector:
+            select:
+              options:
+                - label: Batched volume reports
+                  value: batch
+                - label: Strict flow samples
+                  value: strict
+        confirmation_span:
+          name: Batched mode confirmation time
+          description: >-
+            Three fresh observations, including the flushed reading, must span
+            this time and stay within the temperature range. Keep shorter than
+            the flow pause. A rejected window needs another volume increase.
+          default: 30
+          selector:
+            number: {min: 10, max: 120, step: 1, unit_of_measurement: s, mode: box}
         flush_litres:
           name: Flush volume
           default: 5
           selector:
             number: {min: 0, max: 100, step: 0.1, unit_of_measurement: L, mode: box}
         settle_range:
-          name: Maximum range across three temperatures
+          name: Maximum temperature range
           default: 0.2
           selector:
             number: {min: 0.01, max: 5, step: 0.01, unit_of_measurement: "°C", mode: box}
         settle_span:
-          name: Minimum span of three readings
+          name: Strict mode minimum span of three readings
           description: >-
-            Only volume increases produce candidates. Candidates are spaced by
+            In strict mode only volume increases produce candidates. They are spaced by
             at least half this span so fast updates cannot fill the window too early.
           default: 90
           selector:
@@ -118,6 +141,12 @@ triggers:
   - trigger: state
     entity_id: !input volume_sensor
     id: reading
+  # An empty optional receipt selector matches no entity, rather than all entities.
+  - trigger: event
+    event_type: state_changed
+    event_data:
+      entity_id: !input receipt_sensor
+    id: packet
   - trigger: time_pattern
     seconds: "/15"
     id: tick
@@ -148,6 +177,8 @@ actions:
       pause: !input flow_pause
       timeout: !input reception_timeout
       fresh_hours: !input freshness_hours
+      sampling_mode: !input sampling_mode
+      confirmation_span: !input confirmation_span
       event_kind: >-
         {{ 'reset' if trigger is not defined else
            'invalid' if trigger.platform | default('') == 'state'
@@ -166,7 +197,8 @@ actions:
         {% set raw = states(helper_entity) | from_json(default={}) %}
         {% set old = raw if raw is mapping and raw.get('v') == 1 else {} %}
         {% set cfg = [flush | float, tolerance | float, span | int,
-                      pause | int, timeout | int, fresh_hours | float, volume_factor | float] %}
+                      pause | int, timeout | int, fresh_hours | float, volume_factor | float,
+                      confirmation_span | int if sampling_mode == 'batch' else 0] %}
         {% set a = old.get('a', []) %}
         {% if a is not sequence or a is string or a | length != 2
               or not is_number(a[0]) or not is_number(a[1]) %}{% set a = [] %}{% endif %}
@@ -177,17 +209,26 @@ actions:
         {% set q0 = old.get('q', []) %}
         {% set checked = namespace(q=[]) %}
         {% if q0 is sequence and q0 is not string and q0 is not mapping %}
-          {% for pair in q0[-3:] %}
-            {% if pair is sequence and pair is not string and pair | length == 2
-                  and is_number(pair[0]) and is_number(pair[1]) %}
-              {% set checked.q = checked.q + [[pair[0] | int, pair[1] | float]] %}
+          {% if sampling_mode == 'batch' %}
+            {# Anchor time/temp, last spaced observation time, count, min, max. #}
+            {% if q0 | length == 6 and is_number(q0[0]) and is_number(q0[1])
+                  and is_number(q0[2]) and is_number(q0[3])
+                  and is_number(q0[4]) and is_number(q0[5]) %}
+              {% set checked.q = q0 %}
             {% endif %}
-          {% endfor %}
+          {% else %}
+            {% for pair in q0[-3:] %}
+              {% if pair is sequence and pair is not string and pair | length == 2
+                    and is_number(pair[0]) and is_number(pair[1]) %}
+                {% set checked.q = checked.q + [[pair[0] | int, pair[1] | float]] %}
+              {% endif %}
+            {% endfor %}
+          {% endif %}
         {% endif %}
         {% set s = namespace(p=old.get('p', 0) | float(0), r=old.get('r', 0) | int(0),
              f=old.get('f', 0) | int(0), l=old.get('l', 0) | float(0),
              b=old.get('b', 0) | int(0), z=old.get('z', 0) | int(0),
-             q=checked.q, a=a, d=d) %}
+             q=checked.q, a=a, d=d, accepted=none, accepted_at=0) %}
         {% set temp = states(temperature_entity) %}
         {% set volume = states(volume_entity) %}
         {% set t_state = states[temperature_entity] %}
@@ -219,6 +260,7 @@ actions:
               {% set s.p = litres %}{% set s.r = received %}{% set s.b = 1 %}{% set s.z = 0 %}
             {% endif %}
           {% elif received >= s.r %}
+            {% set fresh_observation = received > s.r %}
             {% set s.r = received %}
             {% set delta = (litres - s.p) | round(3) %}
             {% set s.p = litres %}
@@ -233,22 +275,47 @@ actions:
               {% set s.f = flow_at %}
               {% set s.l = (s.l + delta) | round(3) %}
               {% if s.l >= flush | float %}
-                {% if s.q | length == 0 or flow_at - s.q[-1][0] >= span | float / 2 %}
+                {% if sampling_mode == 'batch' %}
+                  {# Only real volume increases may open a confirmation window. #}
+                  {% if s.q | length == 0 %}
+                    {% set value = temp | float | round(2) %}
+                    {% set s.q = [flow_at, value, flow_at, 1, value, value] %}
+                  {% endif %}
+                {% elif s.q | length == 0 or flow_at - s.q[-1][0] >= span | float / 2 %}
                   {% set s.q = (s.q + [[flow_at, temp | float | round(2)]])[-3:] %}
                   {% if s.q | length == 3 and s.q[-1][0] - s.q[0][0] >= span | int %}
                     {% set values = s.q | map(attribute=1) | list | sort %}
                     {% if values[-1] - values[0] <= tolerance | float + 0.000001 %}
-                      {% set estimate = values[1] %}
-                      {% set s.a = [flow_at, estimate] %}
-                      {% if as_local(as_datetime(flow_at)).strftime('%Y%m%d') | int == day %}
-                        {% set minimum = estimate if s.d[1] is none else [s.d[1], estimate] | min %}
-                        {% set s.d = [day, minimum, s.d[2] | int + 1] %}
-                      {% endif %}
+                      {% set s.accepted = values[1] %}{% set s.accepted_at = flow_at %}
                     {% endif %}
                   {% endif %}
                 {% endif %}
               {% endif %}
             {% endif %}
+            {% if sampling_mode == 'batch' and fresh_observation and s.q | length > 0
+                  and s.f > 0 and 0 <= now_s - s.f <= pause | int %}
+              {% set low = [s.q[4], temp | float | round(2)] | min %}
+              {% set high = [s.q[5], temp | float | round(2)] | max %}
+              {% set s.q = s.q[:4] + [low, high] %}
+              {% if high - low > tolerance | float + 0.000001 %}
+                {# Do not slide a rejected window into a later idle plateau. #}
+                {% set s.q = [] %}
+              {% elif received - s.q[2] >= confirmation_span | float / 2 %}
+                {% set s.q = s.q[:2] + [received, s.q[3] | int + 1, low, high] %}
+                {% if s.q[3] >= 3 and received - s.q[0] >= confirmation_span | int %}
+                  {# Confirm the flow-linked reading; never publish a warmed idle sample. #}
+                  {% set s.accepted = s.q[1] %}{% set s.accepted_at = s.q[0] %}
+                  {% set s.q = [] %}
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endif %}
+        {% endif %}
+        {% if s.accepted is not none %}
+          {% set s.a = [s.accepted_at, s.accepted] %}
+          {% if as_local(as_datetime(s.accepted_at)).strftime('%Y%m%d') | int == day %}
+            {% set minimum = s.accepted if s.d[1] is none else [s.d[1], s.accepted] | min %}
+            {% set s.d = [day, minimum, s.d[2] | int + 1] %}
           {% endif %}
         {% endif %}
         {% if s.f > 0 and now_s - s.f > pause | int %}

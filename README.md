@@ -51,7 +51,9 @@ Two optional [template blueprints](blueprints/template/) are also supplied for m
 - **Volume:** a numeric cumulative meter. Use `1000` litres per unit for m³, `1` for litres, or the appropriate conversion for your meter. Do not select a flow-rate sensor or daily resetting utility meter.
 - **Last received (optional):** a timestamp sensor whose **state becomes the actual receipt time on every fresh packet**, even if temperature and volume stay unchanged. For example, `2026-10-20T10:20:30+00:00`. It must cover reception of both selected measurements, rather than an unrelated device heartbeat. Do not use a template that simply returns `now()`; that would hide outages.
 
-The optional timestamp is how the estimator can prove reception continued during zero flow. It is checked every 15 seconds. If omitted, the most recent `last_updated` of either source provides evidence of reception: only silence in both sources times out. Unchanged states may not update this timestamp, so that fallback can discard legitimate idle intervals conservatively. Neither route treats the absence of volume increases alone as a receiver gap.
+The optional timestamp triggers processing directly whenever its state changes. A new packet carrying the same temperature is a fresh observation: a temperature state change is not required. The 15-second timer handles timeouts and also checks current source state. Each receipt timestamp counts at most once, regardless of how many automation runs it causes. **Recording the timestamp or internal helper is not required.**
+
+If the timestamp is omitted, the most recent `last_updated` of either source provides evidence of reception: only silence in both sources times out. Unchanged states may not update this timestamp, so that fallback can discard legitimate idle intervals conservatively and cannot confirm identical packets that produce no source update. Neither route treats the absence of volume increases alone as a receiver gap. A receipt must describe a fresh meter dataset, rather than a replay of a cached dataset.
 
 Temperature and volume should come from the same meter and be updated together. Processing waits two seconds to accommodate small write-order differences. This is not a join for independently delayed or backfilled histories; align those upstream.
 
@@ -59,27 +61,33 @@ Temperature and volume should come from the same meter and be updated together. 
 
 1. A restart, settings change, unavailable source, or reception timeout clears the unfinished flush/window. The last accepted result survives.
 2. The first fresh observation establishes a cumulative-volume baseline. Volume accumulated across an outage is discarded.
-3. Positive volume deltas accumulate within a water-use session. Idle packets establish continuity but never add temperature candidates.
-4. Once the flush threshold is reached, volume increases can supply temperature candidates. Candidates are spaced by at least half the configured settling span.
-5. Three candidates spanning the settling period and staying within the configured temperature range qualify. Their median becomes the new estimate. A sliding window can qualify again during continued use.
-6. The daily sensor keeps the minimum of accepted estimates and resets at local midnight. If Home Assistant misses midnight, a date guard clears yesterday's daily value on the next run.
+3. Positive volume deltas accumulate within a water-use session. Idle packets cannot start a measurement or add flushed litres.
+4. In the default **batched mode**, a positive volume report that reaches the flush threshold opens a temperature confirmation window. One sufficiently large volume jump is enough; three separate volume increases are not required.
+5. The flushed reading and two subsequent fresh observations must span at least 30 seconds and stay within 0.2 °C. Identical temperatures in new packets count. Confirmation observations are spaced by at least half the configured confirmation time. Once confirmed, publish the temperature and timestamp of the original flushed reading, rather than a later warmed value. No further acceptance occurs without another volume increase.
+6. Any observed temperature excursion beyond the range rejects that window immediately, including observations between the spaced confirmation points. The window cannot slide into a later idle plateau: another volume increase is needed to open a new one. Reception failures, resets, and the flow-pause timeout also clear the window.
+7. Optional **strict mode** retains version 1.0 behavior: three post-flush volume-increase-confirmed temperatures spanning 90 seconds, within 0.2 °C, produce their median.
+8. The daily sensor keeps the minimum of accepted estimates and resets at local midnight. If Home Assistant misses midnight, a date guard clears yesterday's daily value on the next run.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
+| Reporting pattern | Batched | Fresh packets confirm a flushed reading; strict mode remains selectable |
 | Flush volume | 5 L | Water counted after a fresh baseline and within the current session |
-| Settling range | 0.2 °C | Maximum minus minimum across three candidates |
-| Settling span | 90 s | Minimum time from first to third candidate |
+| Temperature range | 0.2 °C | Maximum minus minimum throughout the confirmation window |
+| Batch confirmation | 30 s | Minimum span of three fresh observations, including the flushed reading |
+| Strict settling span | 90 s | Used only in strict mode |
 | Flow pause | 150 s | No increase for longer ends the session and requires another flush |
 | Reception timeout | 180 s | Missing receipt evidence invalidates the volume baseline |
 | Freshness | 24 h | Age threshold for the held sensor's `fresh` attribute |
 
-These are initial tunings. Set the reception timeout longer than your normal packet interval and the flow pause longer than the normal interval between meter increases during a draw. A short toilet flush may never satisfy both flush and settling requirements; it then supplies no estimate. A counter rollback clears the unfinished session and establishes a new baseline.
+These are initial tunings. Set the reception timeout longer than your normal packet interval and the flow pause longer than the normal interval between meter increases during a draw. Keep batch confirmation shorter than the flow pause, with enough time for two fresh packets. The confirmation time is a minimum: with 20-second packets, the usual confirmation takes about 40 seconds. A short draw may still fail the flush or temperature-range requirement. A counter rollback clears the unfinished session and establishes a new baseline.
+
+This is an estimate based on sufficient flushing plus a short stability check, not proof of ongoing flow during confirmation. A stable fresh packet after the draw is valid evidence for that check. The 5 L flush requirement does not guarantee thermal equilibration for every meter or installation; increase it if the meter still shows a cold dip or warm lag after that volume.
 
 ## Outputs and history
 
 The held sensor exposes `measured_at`, `age_hours`, `fresh`, `reception_healthy`, `last_observed_at`, `status`, and `flushed_litres`. Its value can remain present while `fresh` is false or reception is unhealthy. It is unavailable until the first accepted measurement; Home Assistant may omit its custom attributes while unavailable.
 
-The daily sensor exposes the local date, accepted-reading count, and last measurement time. A day without qualifying use is unavailable, rather than a warmed meter reading or yesterday's value. Acceptance counts are sliding-window estimates, not counts of independent draws.
+The daily sensor exposes the local date, accepted-reading count, and last measurement time. A day without qualifying use is unavailable, rather than a warmed meter reading or yesterday's value. Acceptance counts are qualified estimates, not counts of independent draws. A flushed reading taken before midnight and confirmed after midnight updates the held sensor but is not counted toward the new day's minimum.
 
 The held sensor intentionally has no statistics `state_class`, because averaging a stale held value would be misleading. The daily sensor uses `measurement`; for an annual daily-minimum chart, use **minimum** aggregation. Intraday means average a progressively falling daily minimum, rather than the actual incoming-water samples. Ensure Recorder includes the output sensors if you use include filters.
 
@@ -87,13 +95,15 @@ The held sensor intentionally has no statistics `state_class`, because averaging
 
 The automation runs queued and reads the helper inside its action sequence, preventing simultaneous sensor updates from overwriting each other's state. It writes only when the encoded state changes. Never share a state helper between automation instances.
 
-JSON version 1 uses: `p` prior volume in litres, `r` receipt time, `f` last flow time, `l` session litres, `b` baseline flag, `z` reset time, `q` up to three `[time, temperature]` candidates, `a` accepted `[time, temperature]`, `d` local date/minimum/count, and `c` settings. Times are Unix seconds. Do not edit this internal state manually. Oversized state stops the run and preserves the previous helper value rather than truncating JSON.
+JSON version 1 uses: `p` prior volume in litres, `r` receipt time, `f` last flow time, `l` session litres, `b` baseline flag, `z` reset time, `q` pending confirmation data, `a` accepted `[time, temperature]`, `d` local date/minimum/count, and `c` settings. In batched mode, `q` holds `[anchor_time, anchor_temperature, last_spaced_observation_time, count, minimum, maximum]`; strict mode uses up to three `[time, temperature]` pairs. The eighth settings value is the batch confirmation time, or zero for strict mode. Times are Unix seconds. Do not edit this internal state manually. Oversized state stops the run and preserves the previous helper value rather than truncating JSON.
 
 Reloading automations or using **Run actions** deliberately resets the unfinished session and waits for fresh receipt evidence. It preserves the accepted result and today's minimum. The blueprint's source URL supports Home Assistant's **Re-import blueprint** workflow. Sensor YAML/template blueprint updates are separate from automation updates.
 
+Version 1.1 defaults to batched mode and adds direct receipt-timestamp triggering. Existing instances automatically get the new defaults after re-import. The state migration discards unfinished work and preserves accepted values; companion sensors need no changes. Select strict mode to retain the previous qualification rule.
+
 ## Development
 
-The tests execute the shipped Jinja reducer, including gap recovery, idle reception, counter resets, restart recovery, midnight rollover, stability checks, and dense updates.
+The tests execute the shipped Jinja reducer, including coarse volume batches, unchanged-temperature packets, duplicate-run rejection, warming-window rejection, gap recovery, idle reception, counter resets, restart recovery, midnight rollover, strict stability checks, and dense updates.
 
 ```sh
 uv run python -m unittest discover -s tests -v

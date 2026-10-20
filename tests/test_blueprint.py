@@ -65,7 +65,7 @@ class States:
 
 
 class Harness:
-    def __init__(self,heartbeat=True):
+    def __init__(self,heartbeat=True,mode='strict'):
         self.t=int(datetime(2026,10,20,10,tzinfo=TZ).timestamp())
         self.states=States()
         self.states.set('input_text.state','',self.t)
@@ -74,7 +74,8 @@ class Harness:
         self.states.set('sensor.received',as_datetime(self.t).isoformat(),self.t)
         self.variables={'temperature_entity':'sensor.temperature','volume_entity':'sensor.volume',
                         'helper_entity':'input_text.state','receipt_entity':'sensor.received' if heartbeat else [],
-                        'volume_factor':1000,'flush':5,'tolerance':.2,'span':90,'pause':150,'timeout':180,'fresh_hours':24}
+                        'volume_factor':1000,'flush':5,'tolerance':.2,'span':90,'pause':150,'timeout':180,'fresh_hours':24,
+                        'sampling_mode':mode,'confirmation_span':30}
         self.env=NativeEnvironment(undefined=StrictUndefined)
         self.env.filters.update(from_json=from_json,to_json=lambda v: json.dumps(v,separators=(',',':')))
         self.env.globals.update(states=self.states,now=lambda:as_datetime(self.t).astimezone(TZ),
@@ -122,6 +123,128 @@ class BlueprintTests(unittest.TestCase):
         self.assertFalse(any(t['trigger']=='mqtt' for t in AUTOMATION['triggers']))
         self.assertEqual(AUTOMATION['mode'],'queued')
         self.assertTrue(all('selector' in v for section in AUTOMATION['blueprint']['input'].values() for v in section['input'].values()))
+        self.assertTrue(any(t.get('id')=='packet' and t.get('event_data',{}).get('entity_id')=={'input':'receipt_sensor'}
+                            for t in AUTOMATION['triggers']))
+
+    def test_batch_two_coarse_increases_need_no_further_volume_change(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.003,temperature=13.5)
+        self.assertEqual(h.s['q'],[])
+        h.advance(82,volume=1.011,temperature=13.6)
+        flow_time=h.t
+        self.assertEqual(h.s['a'],[])
+        h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+        h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[flow_time,13.6])
+        self.assertEqual(h.s['d'][2],1)
+        for _ in range(8):
+            h.advance(20,event='packet')
+        self.assertEqual(h.s['d'][2],1)
+
+    def test_single_flushed_batch_can_qualify(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.008,temperature=14)
+        flow_time=h.t
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[flow_time,14])
+
+    def test_idle_or_insufficient_volume_packets_cannot_start_batch(self):
+        for volume in [None,1.003]:
+            with self.subTest(volume=volume):
+                h=Harness(mode='batch');h.establish()
+                h.advance(60,volume=volume,temperature=14)
+                for _ in range(10):
+                    h.advance(20,event='packet')
+                self.assertEqual(h.s['a'],[])
+
+    def test_duplicate_runs_without_new_receipt_cannot_confirm(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.008,temperature=14)
+        for _ in range(5):
+            h.advance(20,receipt=False,event='tick')
+        self.assertEqual(h.s['q'][3],1)
+        self.assertEqual(h.s['a'],[])
+
+    def test_rejected_batch_cannot_slide_into_later_idle_plateau(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.008,temperature=14)
+        h.advance(20,temperature=14.3,event='packet')
+        self.assertEqual(h.s['q'],[])
+        for _ in range(5):
+            h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+        h.advance(20,volume=1.011,temperature=14)
+        flow_time=h.t
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[flow_time,14])
+
+    def test_batch_publishes_flow_temperature_not_later_warming(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.008,temperature=14)
+        flow_time=h.t
+        h.advance(20,temperature=14.1,event='packet')
+        h.advance(20,temperature=14.2,event='packet')
+        self.assertEqual(h.s['a'],[flow_time,14])
+
+    def test_batch_keeps_extrema_between_spaced_confirmation_points(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.008,temperature=14)
+        h.advance(5,temperature=14.2,event='packet')
+        self.assertEqual(h.s['q'][3],1)
+        h.advance(15,temperature=13.9,event='packet')
+        self.assertEqual(h.s['q'],[])
+        self.assertEqual(h.s['a'],[])
+
+    def test_counter_reset_cancels_pending_batch(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.008,temperature=14)
+        h.advance(20,volume=.001,event='packet')
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+
+    def test_batch_confirmed_after_midnight_keeps_original_measurement_date(self):
+        h=Harness(mode='batch');h.establish()
+        h.t=int(datetime(2026,10,20,23,59,30,tzinfo=TZ).timestamp())
+        h.states.set('sensor.received',as_datetime(h.t).isoformat(),h.t)
+        h.run()
+        h.advance(20,volume=1.008,temperature=14)
+        flow_time=h.t
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[flow_time,14])
+        self.assertEqual(h.s['d'],[20261021,None,0])
+
+    def test_continued_fine_flow_does_not_restart_confirmation(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.005,temperature=14)
+        h.advance(20,volume=1.006,temperature=14)
+        h.advance(20,volume=1.007,temperature=14)
+        self.assertEqual(h.s['a'][1],14)
+
+    def test_batch_reception_gap_discards_confirmation_and_volume_jump(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.008,temperature=14)
+        h.advance(181,volume=1.040,temperature=14)
+        for _ in range(3):
+            h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+        self.assertEqual(h.s['l'],0)
+
+    def test_batch_flow_pause_prevents_late_confirmation(self):
+        h=Harness(mode='batch');h.establish()
+        h.advance(60,volume=1.008,temperature=14)
+        h.advance(151,event='packet')
+        for _ in range(3):
+            h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+
+    def test_migration_preserves_accepted_value_and_resets_pending_samples(self):
+        h=Harness();h.qualify();accepted=h.s['a'][:]
+        h.variables['sampling_mode']='batch'
+        h.run('tick')
+        self.assertEqual(h.s['a'],accepted)
+        self.assertEqual(h.s['b'],0)
+        self.assertEqual(h.s['q'],[])
 
     def test_flush_and_stable_median(self):
         h=Harness();s=h.qualify()
