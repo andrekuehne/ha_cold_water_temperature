@@ -1,0 +1,40 @@
+blueprint:
+  name: Today’s minimum incoming water temperature
+  description: Display sensor for the flow-qualified water-temperature automation. Reads its single Text
+    helper. Version 1.0.0.
+  domain: template
+  author: Andre Kuehne
+  source_url: https://github.com/andrekuehne/ha_cold_water_temperature/blob/main/blueprints/template/cold_water_temperature_today.yaml
+  homeassistant:
+    min_version: 2024.11.0
+  input:
+    state_helper:
+      name: Estimator state helper
+      selector:
+        entity:
+          filter:
+            domain: input_text
+    name:
+      name: Sensor name
+      default: Incoming water temperature today
+      selector:
+        text: null
+variables:
+  helper_entity: !input 'state_helper'
+sensor:
+  name: !input 'name'
+  device_class: temperature
+  unit_of_measurement: °C
+  state_class: measurement
+  availability: "{% set s = states(helper_entity) | from_json(default={}) %} {{ s is mapping and s.get('v')\
+    \ == 1 and s.get('d', []) | length == 3\n     and s.d[0] == now().strftime('%Y%m%d') | int and s.d[2]\
+    \ > 0 and s.d[1] is not none }}"
+  state: "{% set s = states(helper_entity) | from_json(default={}) %} {{ s.d[1] if s is mapping and s.get('d',\
+    \ []) | length == 3\n     and s.d[0] == now().strftime('%Y%m%d') | int else none }}"
+  attributes:
+    date: '{{ now().date().isoformat() }}'
+    accepted_readings: "{% set s = states(helper_entity) | from_json(default={}) %} {{ s.d[2] if s is\
+      \ mapping and s.get('d', []) | length == 3\n     and s.d[0] == now().strftime('%Y%m%d') | int else\
+      \ 0 }}"
+    last_measured_at: '{% set s = states(helper_entity) | from_json(default={}) %} {{ as_datetime(s.a[0]).isoformat()
+      if s is mapping and s.get(''a'', []) | length == 2 else none }}'

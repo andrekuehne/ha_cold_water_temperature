@@ -1,0 +1,56 @@
+# No initial value: restore the last accepted result across restarts.
+input_text:
+  incoming_water_state:
+    name: Incoming water state
+    max: 255
+    icon: mdi:water-thermometer
+template:
+- variables:
+    helper_entity: input_text.incoming_water_state
+  sensor:
+  - name: Incoming water temperature
+    device_class: temperature
+    unit_of_measurement: °C
+    availability: '{% set s = states(helper_entity) | from_json(default={}) %} {{ s is mapping and s.get(''v'')
+      == 1 and s.get(''a'', []) | length == 2 }}'
+    state: '{% set s = states(helper_entity) | from_json(default={}) %} {{ s.get(''a'', [none, none])[1]
+      if s is mapping and s.get(''a'', []) | length == 2 else none }}'
+    attributes:
+      measured_at: '{% set s = states(helper_entity) | from_json(default={}) %} {{ as_datetime(s.a[0]).isoformat()
+        if s is mapping and s.get(''a'', []) | length == 2 else none }}'
+      age_hours: "{% set s = states(helper_entity) | from_json(default={}) %} {{ ((as_timestamp(now())\
+        \ - s.a[0]) / 3600) | round(2)\n   if s is mapping and s.get('a', []) | length == 2 else none\
+        \ }}"
+      fresh: "{% set s = states(helper_entity) | from_json(default={}) %} {{ s is mapping and s.get('a',\
+        \ []) | length == 2 and s.get('c', []) | length >= 6\n   and 0 <= as_timestamp(now()) - s.a[0]\
+        \ < s.c[5] * 3600 }}"
+      reception_healthy: "{% set s = states(helper_entity) | from_json(default={}) %} {{ s is mapping\
+        \ and s.get('b', 0) == 1 and s.get('c', []) | length >= 5\n   and 0 <= as_timestamp(now()) - s.get('r',\
+        \ 0) <= s.c[4] }}"
+      last_observed_at: '{% set s = states(helper_entity) | from_json(default={}) %} {{ as_datetime(s.r).isoformat()
+        if s is mapping and s.get(''r'', 0) > 0 else none }}'
+      status: "{% set s = states(helper_entity) | from_json(default={}) %} {% if s is not mapping or s.get('b',\
+        \ 0) == 0 or s.get('c', []) | length < 5 %}\n  waiting_for_data\n{% elif as_timestamp(now()) -\
+        \ s.get('r', 0) > s.c[4] %}\n  waiting_for_data\n{% elif s.get('f', 0) == 0 or as_timestamp(now())\
+        \ - s.f > s.c[3] %}\n  idle\n{% elif s.get('l', 0) < s.c[0] %}\n  flushing\n{% else %}\n  sampling\n\
+        {% endif %}"
+      flushed_litres: '{% set s = states(helper_entity) | from_json(default={}) %} {{ s.get(''l'', 0)
+        if s is mapping else 0 }}'
+    unique_id: incoming_water_temperature
+  - name: Incoming water temperature today
+    device_class: temperature
+    unit_of_measurement: °C
+    state_class: measurement
+    availability: "{% set s = states(helper_entity) | from_json(default={}) %} {{ s is mapping and s.get('v')\
+      \ == 1 and s.get('d', []) | length == 3\n     and s.d[0] == now().strftime('%Y%m%d') | int and s.d[2]\
+      \ > 0 and s.d[1] is not none }}"
+    state: "{% set s = states(helper_entity) | from_json(default={}) %} {{ s.d[1] if s is mapping and\
+      \ s.get('d', []) | length == 3\n     and s.d[0] == now().strftime('%Y%m%d') | int else none }}"
+    attributes:
+      date: '{{ now().date().isoformat() }}'
+      accepted_readings: "{% set s = states(helper_entity) | from_json(default={}) %} {{ s.d[2] if s is\
+        \ mapping and s.get('d', []) | length == 3\n     and s.d[0] == now().strftime('%Y%m%d') | int\
+        \ else 0 }}"
+      last_measured_at: '{% set s = states(helper_entity) | from_json(default={}) %} {{ as_datetime(s.a[0]).isoformat()
+        if s is mapping and s.get(''a'', []) | length == 2 else none }}'
+    unique_id: incoming_water_temperature_today

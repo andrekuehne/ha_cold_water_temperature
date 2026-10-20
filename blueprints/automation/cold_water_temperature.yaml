@@ -1,0 +1,273 @@
+blueprint:
+  name: Incoming water temperature — flow-qualified estimate
+  description: >-
+    Estimate incoming water temperature only after a configurable flush and a
+    stable window of water-use readings. Works with ordinary Home Assistant
+    sensor entities from any integration; MQTT is not required. Uses one
+    input_text helper (maximum length 255) for all persistent state. Create
+    the two display sensors with the companion package or template blueprints. Temperatures
+    must be in °C; configure the conversion from the cumulative meter to litres.
+    Use a dedicated helper for each automation instance. Version 1.0.0.
+  domain: automation
+  author: Andre Kuehne
+  source_url: https://github.com/andrekuehne/ha_cold_water_temperature/blob/main/blueprints/automation/cold_water_temperature.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    sources:
+      name: Source sensors and storage
+      input:
+        temperature_sensor:
+          name: Raw water temperature
+          description: Temperature in °C, including readings when water is idle.
+          selector:
+            entity:
+              filter:
+                domain: sensor
+                device_class: temperature
+        volume_sensor:
+          name: Cumulative water volume
+          description: A cumulative meter, not a daily utility meter or flow rate.
+          selector:
+            entity:
+              filter:
+                domain: sensor
+        state_helper:
+          name: Persistent state helper
+          description: A dedicated Text helper with maximum length set to 255.
+          selector:
+            entity:
+              filter:
+                domain: input_text
+        receipt_sensor:
+          name: Last received timestamp (optional)
+          description: >-
+            A timestamp that changes for every received reading, including
+            unchanged temperature and volume. Without it, updates from either
+            source sensor establish continuity; long periods with unchanged
+            values are conservatively treated as possible data gaps.
+          default: []
+          selector:
+            entity:
+              filter:
+                domain: sensor
+                device_class: timestamp
+        litres_per_unit:
+          name: Litres per volume unit
+          description: Use 1000 for m³, 1 for litres, or 28.316847 for ft³.
+          default: 1000
+          selector:
+            number:
+              min: 0.001
+              max: 1000000
+              step: 0.001
+              mode: box
+    qualification:
+      name: Measurement qualification
+      input:
+        flush_litres:
+          name: Flush volume
+          default: 5
+          selector:
+            number: {min: 0, max: 100, step: 0.1, unit_of_measurement: L, mode: box}
+        settle_range:
+          name: Maximum range across three temperatures
+          default: 0.2
+          selector:
+            number: {min: 0.01, max: 5, step: 0.01, unit_of_measurement: "°C", mode: box}
+        settle_span:
+          name: Minimum span of three readings
+          description: >-
+            Only volume increases produce candidates. Candidates are spaced by
+            at least half this span so fast updates cannot fill the window too early.
+          default: 90
+          selector:
+            number: {min: 10, max: 600, step: 1, unit_of_measurement: s, mode: box}
+    timing:
+      name: Pauses, missing data and freshness
+      collapsed: true
+      input:
+        flow_pause:
+          name: End water-use session after no volume increase
+          description: A flow pause resets flushing; it is not a receiver outage.
+          default: 150
+          selector:
+            number: {min: 30, max: 1800, step: 1, unit_of_measurement: s, mode: box}
+        reception_timeout:
+          name: Reception timeout
+          description: >-
+            With a receipt sensor, use its timestamp. Otherwise require silence
+            in both source histories. Never count a cross-gap volume jump.
+          default: 180
+          selector:
+            number: {min: 30, max: 3600, step: 1, unit_of_measurement: s, mode: box}
+        freshness_hours:
+          name: Accepted temperature freshness
+          default: 24
+          selector:
+            number: {min: 1, max: 168, step: 1, unit_of_measurement: h, mode: box}
+
+mode: queued
+max: 25
+max_exceeded: warning
+
+triggers:
+  - trigger: state
+    entity_id: !input temperature_sensor
+    id: reading
+  - trigger: state
+    entity_id: !input volume_sensor
+    id: reading
+  - trigger: time_pattern
+    seconds: "/15"
+    id: tick
+  - trigger: time
+    at: "00:00:00"
+    id: midnight
+  - trigger: homeassistant
+    event: start
+    id: reset
+  - trigger: event
+    event_type: automation_reloaded
+    id: reset
+
+actions:
+  # Coalesce small write-order differences between the two source entities.
+  # No state is read until the queued run begins, preventing lost updates.
+  - delay:
+      seconds: 2
+  - variables:
+      temperature_entity: !input temperature_sensor
+      volume_entity: !input volume_sensor
+      helper_entity: !input state_helper
+      receipt_entity: !input receipt_sensor
+      volume_factor: !input litres_per_unit
+      flush: !input flush_litres
+      tolerance: !input settle_range
+      span: !input settle_span
+      pause: !input flow_pause
+      timeout: !input reception_timeout
+      fresh_hours: !input freshness_hours
+      event_kind: >-
+        {{ 'reset' if trigger is not defined else
+           'invalid' if trigger.platform | default('') == 'state'
+             and trigger.to_state is not none
+             and trigger.to_state.state in ['unknown', 'unavailable']
+           else trigger.id | default('reset') }}
+  - if:
+      - "{{ states(helper_entity) == 'unavailable' or state_attr(helper_entity, 'max') | int(0) < 255 }}"
+    then:
+      - stop: State helper must exist, be available, and have maximum length 255.
+        error: true
+  - variables:
+      next_state: >-
+        {% set now_s = as_timestamp(now()) | int %}
+        {% set day = now().strftime('%Y%m%d') | int %}
+        {% set raw = states(helper_entity) | from_json(default={}) %}
+        {% set old = raw if raw is mapping and raw.get('v') == 1 else {} %}
+        {% set cfg = [flush | float, tolerance | float, span | int,
+                      pause | int, timeout | int, fresh_hours | float, volume_factor | float] %}
+        {% set a = old.get('a', []) %}
+        {% if a is not sequence or a is string or a | length != 2
+              or not is_number(a[0]) or not is_number(a[1]) %}{% set a = [] %}{% endif %}
+        {% set d = old.get('d', []) %}
+        {% if d is not sequence or d is string or d | length != 3
+              or d[0] != day or not is_number(d[2]) %}{% set d = [day, none, 0] %}{% endif %}
+        {% if d[1] is not none and not is_number(d[1]) %}{% set d = [day, none, 0] %}{% endif %}
+        {% set q0 = old.get('q', []) %}
+        {% set checked = namespace(q=[]) %}
+        {% if q0 is sequence and q0 is not string and q0 is not mapping %}
+          {% for pair in q0[-3:] %}
+            {% if pair is sequence and pair is not string and pair | length == 2
+                  and is_number(pair[0]) and is_number(pair[1]) %}
+              {% set checked.q = checked.q + [[pair[0] | int, pair[1] | float]] %}
+            {% endif %}
+          {% endfor %}
+        {% endif %}
+        {% set s = namespace(p=old.get('p', 0) | float(0), r=old.get('r', 0) | int(0),
+             f=old.get('f', 0) | int(0), l=old.get('l', 0) | float(0),
+             b=old.get('b', 0) | int(0), z=old.get('z', 0) | int(0),
+             q=checked.q, a=a, d=d) %}
+        {% set temp = states(temperature_entity) %}
+        {% set volume = states(volume_entity) %}
+        {% set t_state = states[temperature_entity] %}
+        {% set v_state = states[volume_entity] %}
+        {% set heartbeat = receipt_entity is string and receipt_entity | length > 0 %}
+        {% if heartbeat %}
+          {% set received = as_timestamp(states(receipt_entity), 0) | int %}
+        {% else %}
+          {% set received = ([as_timestamp(t_state.last_updated, 0) if t_state is not none else 0,
+                              as_timestamp(v_state.last_updated, 0) if v_state is not none else 0] | max) | int %}
+        {% endif %}
+        {% set available = is_number(temp) and is_number(volume)
+             and temp | float >= -100 and temp | float <= 150
+             and volume | float >= 0 and volume | float * volume_factor | float <= 1000000000000
+             and received > 0 and -5 <= now_s - received <= timeout | int %}
+        {% set config_changed = old.get('c') != cfg %}
+        {% set restart = event_kind in ['reset', 'invalid'] or config_changed %}
+        {% set gap = s.r > 0 and received - s.r > timeout | int %}
+        {% if restart or not available or gap %}
+          {% if s.b or restart %}{% set s.z = now_s %}{% endif %}
+          {% set s.b = 0 %}{% set s.f = 0 %}{% set s.l = 0 %}{% set s.q = [] %}
+          {% set s.r = 0 %}
+        {% endif %}
+        {% if available and not restart %}
+          {% set litres = (volume | float * volume_factor | float) | round(3) %}
+          {% if s.b == 0 %}
+            {# A newly observed snapshot establishes the baseline; never count its jump. #}
+            {% if received > s.z or gap %}
+              {% set s.p = litres %}{% set s.r = received %}{% set s.b = 1 %}{% set s.z = 0 %}
+            {% endif %}
+          {% elif received >= s.r %}
+            {% set s.r = received %}
+            {% set delta = (litres - s.p) | round(3) %}
+            {% set s.p = litres %}
+            {% if delta < 0 %}
+              {# Counter reset: this value is the new baseline, not negative flow. #}
+              {% set s.f = 0 %}{% set s.l = 0 %}{% set s.q = [] %}
+            {% elif delta > 0 %}
+              {% set flow_at = as_timestamp(v_state.last_updated, now_s) | int %}
+              {% if s.f == 0 or flow_at - s.f > pause | int %}
+                {% set s.l = 0 %}{% set s.q = [] %}
+              {% endif %}
+              {% set s.f = flow_at %}
+              {% set s.l = (s.l + delta) | round(3) %}
+              {% if s.l >= flush | float %}
+                {% if s.q | length == 0 or flow_at - s.q[-1][0] >= span | float / 2 %}
+                  {% set s.q = (s.q + [[flow_at, temp | float | round(2)]])[-3:] %}
+                  {% if s.q | length == 3 and s.q[-1][0] - s.q[0][0] >= span | int %}
+                    {% set values = s.q | map(attribute=1) | list | sort %}
+                    {% if values[-1] - values[0] <= tolerance | float + 0.000001 %}
+                      {% set estimate = values[1] %}
+                      {% set s.a = [flow_at, estimate] %}
+                      {% if as_local(as_datetime(flow_at)).strftime('%Y%m%d') | int == day %}
+                        {% set minimum = estimate if s.d[1] is none else [s.d[1], estimate] | min %}
+                        {% set s.d = [day, minimum, s.d[2] | int + 1] %}
+                      {% endif %}
+                    {% endif %}
+                  {% endif %}
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endif %}
+        {% endif %}
+        {% if s.f > 0 and now_s - s.f > pause | int %}
+          {% set s.f = 0 %}{% set s.l = 0 %}{% set s.q = [] %}
+        {% endif %}
+        {{ {'v':1,'p':s.p,'r':s.r,'f':s.f,'l':s.l,'b':s.b,'z':s.z,
+            'q':s.q,'a':s.a,'d':s.d,'c':cfg} }}
+  - variables:
+      encoded_state: "{{ next_state | to_json | replace(', ', ',') | replace(': ', ':') }}"
+  - if:
+      - "{{ encoded_state | string | length > 255 }}"
+    then:
+      - stop: Estimator state exceeds 255 characters; previous state has been preserved.
+        error: true
+  - if:
+      - "{{ states(helper_entity) != encoded_state }}"
+    then:
+      - action: input_text.set_value
+        target:
+          entity_id: !input state_helper
+        data:
+          value: "{{ encoded_state }}"
