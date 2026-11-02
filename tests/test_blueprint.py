@@ -132,6 +132,64 @@ class Harness:
 
 
 class BlueprintTests(unittest.TestCase):
+    def current_defaults(self):
+        inputs={key:value for section in AUTOMATION['blueprint']['input'].values() for key,value in section['input'].items()}
+        h=Harness(mode='batch')
+        mapping={'flush':'flush_litres','confirmation_span':'confirmation_span','idle_hours':'long_idle_hours',
+                 'guarded_flush':'guarded_flush_litres','guarded_wait':'guarded_delay','guarded_span':'guarded_confirmation_span'}
+        h.variables.update({var:inputs[key]['default'] for var,key in mapping.items()})
+        return h
+
+    def test_default_tuning_rejects_short_seven_litre_cold_pulse(self):
+        h=self.current_defaults();h.variables['idle_hours']=0;h.establish()
+        h.advance(60,volume=1.007,temperature=12.1)
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+        h.advance(20,volume=1.009,temperature=12.5)
+        h.advance(60,volume=1.010,temperature=12.5)
+        h.advance(60,volume=1.013,temperature=12.4)
+        for _ in range(6): h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+        self.assertEqual(h.s['d'][2],0)
+
+    def test_default_tuning_selects_later_continued_flow_plateau(self):
+        h=self.current_defaults();h.variables['idle_hours']=0;h.establish()
+        h.advance(60,volume=1.006,temperature=12.4)
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+        h.advance(20,volume=1.013,temperature=12.5)
+        self.assertEqual(h.s['q'],[])
+        h.advance(60,volume=1.021,temperature=12.7)
+        anchor=h.t
+        for _ in range(5):
+            h.advance(20,event='packet')
+            self.assertEqual(h.s['a'],[])
+        h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[anchor,12.7])
+        self.assertEqual(h.s['d'][1],12.7)
+
+    def test_longer_default_confirmation_rejects_one_minute_dip_after_large_batch(self):
+        h=self.current_defaults();h.variables['idle_hours']=0;h.establish()
+        h.advance(60,volume=1.015,temperature=12.1)
+        h.advance(20,event='packet');h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+        h.advance(20,temperature=12.4,event='packet')
+        self.assertEqual(h.s['q'],[])
+        for _ in range(6): h.advance(20,event='packet')
+        self.assertEqual(h.s['a'],[])
+
+    def test_current_default_guard_rearms_after_one_hour(self):
+        h=self.current_defaults();h.establish()
+        h.advance(60,volume=1.008,temperature=12.1)
+        h.advance(60,volume=1.012,temperature=12.4)
+        h.advance(60,volume=1.020,temperature=12.7)
+        for _ in range(6): h.advance(20,event='packet')
+        self.assertEqual(h.s['a'][1],12.7)
+        self.assertEqual(h.s['h'],0)
+        last_flow=h.s['f']
+        h.idle_for(last_flow+3600-h.t)
+        self.assertEqual(h.s['h'],1)
+
     def test_guard_excludes_cold_dip_and_needs_flow_after_wait(self):
         h=Harness(mode='batch',guard=True);h.establish()
         h.advance(60,volume=1.006,temperature=13.5)

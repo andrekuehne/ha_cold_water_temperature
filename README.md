@@ -63,7 +63,7 @@ Temperature and volume should come from the same meter and be updated together. 
 2. The first fresh observation establishes a cumulative-volume baseline. Volume accumulated across an outage is discarded.
 3. Positive volume deltas accumulate within a water-use session. Idle packets cannot start a measurement or add flushed litres.
 4. In the default **batched mode**, a positive volume report that reaches the flush threshold opens a temperature confirmation window. One sufficiently large volume jump is enough during normal use; three separate volume increases are not required. An armed long-idle guard first requires the additional volume/time gates described below.
-5. The flushed reading and two subsequent fresh observations must span at least 30 seconds and stay within 0.2 °C. Identical temperatures in new packets count. Confirmation observations are spaced by at least half the configured confirmation time. Once confirmed, publish the temperature and timestamp of the original flushed reading, rather than a later warmed value. No further acceptance occurs without another volume increase.
+5. The flushed reading and two subsequent fresh observations must span at least 90 seconds and stay within 0.2 °C. Identical temperatures in new packets count. Confirmation observations are spaced by at least half the configured confirmation time. Once confirmed, publish the temperature and timestamp of the original flushed reading, rather than a later warmed value. No further acceptance occurs without another volume increase.
 6. Any observed temperature excursion beyond the range rejects that window immediately, including observations between the spaced confirmation points. The window cannot slide into a later idle plateau: another volume increase is needed to open a new one. Reception failures, resets, and the flow-pause timeout also clear the window.
 7. Optional **strict mode** retains version 1.0 behavior: three post-flush volume-increase-confirmed temperatures spanning 90 seconds, within 0.2 °C, produce their median.
 8. The daily sensor keeps the minimum of accepted estimates and resets at local midnight. If Home Assistant misses midnight, a date guard clears yesterday's daily value on the next run.
@@ -71,28 +71,28 @@ Temperature and volume should come from the same meter and be updated together. 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | Reporting pattern | Batched | Fresh packets confirm a flushed reading; strict mode remains selectable |
-| Flush volume | 5 L | Water counted after a fresh baseline and within the current session |
+| Flush volume | 15 L | Water counted after a fresh baseline and within the current session |
 | Temperature range | 0.2 °C | Maximum minus minimum throughout the confirmation window |
-| Batch confirmation | 30 s | Minimum span of three fresh observations, including the flushed reading |
-| Arm long-idle guard | 3 h | Time without a positive volume increase; zero disables the guard |
-| Guarded flush volume | 10 L | Required in one guarded water-use session, at least the normal flush volume |
+| Batch confirmation | 90 s | Minimum span of three fresh observations, including the flushed reading |
+| Arm long-idle guard | 1 h | Time without a positive volume increase; zero disables the guard |
+| Guarded flush volume | 15 L | Required in one guarded water-use session, at least the normal flush volume |
 | Guarded initial delay | 120 s | Exclude early readings; a volume increase at or after this delay must arrive |
-| Guarded confirmation | 30 s | Fresh-observation stability span after the volume and delay gates |
+| Guarded confirmation | 90 s | Fresh-observation stability span after the volume and delay gates |
 | Strict settling span | 90 s | Used only in strict mode |
 | Flow pause | 150 s | No increase for longer ends the session and requires another flush |
 | Reception timeout | 180 s | Missing receipt evidence invalidates the volume baseline |
 | Freshness | 24 h | Age threshold for the held sensor's `fresh` attribute |
 
-These are initial tunings. Set the reception timeout longer than your normal packet interval and the flow pause longer than the normal interval between meter increases during a draw. Keep batch confirmation shorter than the flow pause, with enough time for two fresh packets. The confirmation time is a minimum: with 20-second packets, the usual confirmation takes about 40 seconds. A short draw may still fail the flush or temperature-range requirement. A counter rollback clears the unfinished session and establishes a new baseline.
+These are starting tunings. Set the reception timeout longer than your normal packet interval and the flow pause longer than the normal interval between meter increases during a draw. Keep batch confirmation shorter than the flow pause, with enough time for two fresh packets. The confirmation time is a minimum: with 20-second packets and the observation-spacing rule, a 90-second setting usually takes about 120 seconds to confirm. A short draw may fail the flush or temperature-range requirement. A counter rollback clears the unfinished session and establishes a new baseline.
 
-This is an estimate based on sufficient flushing plus a short stability check, not proof of ongoing flow during confirmation. A stable fresh packet after the draw is valid evidence for that check. The 5 L flush requirement does not guarantee thermal equilibration for every meter or installation; increase it if the meter still shows a cold dip or warm lag after that volume.
+This is an estimate based on sufficient flushing plus a stability check, not proof of ongoing flow during confirmation. A stable fresh packet after the draw is valid evidence for that check. Even a 15 L flush does not guarantee thermal equilibration for every meter or installation; increase it if the meter still shows a cold dip or warm lag after that volume. The daily minimum favors the lowest qualifying estimate, so inadequate flushing can bias it low. A day with no qualifying draw stays unavailable while the separate last-valid sensor retains its previous value.
 
 ## Long-idle guard
 
-The **Long-idle guard** input section makes all four thresholds configurable. By default, after three hours without a positive volume increase, the guard stays armed until a stronger measurement qualifies:
+The **Long-idle guard** input section makes all four thresholds configurable. By default, after one hour without a positive volume increase, the guard stays armed until a stronger measurement qualifies:
 
 1. The first observed volume increase starts a guarded draw and its delay timer.
-2. Accumulate at least 10 L in that draw and wait at least 120 seconds from its first increase. The threshold is never lower than your normal flush setting.
+2. Accumulate at least 15 L in that draw and wait at least 120 seconds from its first increase. The threshold is never lower than your normal flush setting.
 3. A positive volume increase at or after the delay must arrive before a confirmation window can open. Packets with unchanged volume cannot open it, regardless of elapsed time. Temperatures from before the gates are excluded completely.
 4. Confirm the new reading with fresh packets spanning at least the guarded confirmation time, within the existing temperature-range setting. Identical temperatures in new packets count. Strict mode retains its three flow-confirmed samples and uses the longer of its normal span and the guarded confirmation time.
 5. Only successful acceptance disarms the guard. Later draws return to normal qualification until another long idle period occurs.
@@ -124,6 +124,8 @@ Reloading automations or using **Run actions** deliberately resets the unfinishe
 Version 1.1 defaults to batched mode and adds direct receipt-timestamp triggering. Existing instances automatically get the new defaults after re-import. The state migration discards unfinished work and preserves accepted values; companion sensors need no changes. Select strict mode to retain the previous qualification rule.
 
 Version 1.2 adds the configurable long-idle guard, enabled by default. It starts armed on upgrade, preserves accepted values, and compresses candidate times inside the existing helper. Update the companion sensor YAML/template blueprint for guard-status attributes; the previous companion sensors remain compatible for temperature display.
+
+Version 1.2.1 revises tuning after observed early cold pulses: normal flush 15 L, normal/guarded confirmation 90 seconds, and guard arming after one hour with a 15 L guarded flush. The guarded initial delay stays 120 seconds. A brief stable pulse can outlast a 30-second confirmation window, even after less than three hours idle. The new defaults favor fewer, better-flushed estimates; they remain configurable and are not a calibration guarantee. Explicit input overrides in an existing automation are preserved by re-import, so review those separately. Historical Recorder data is not rewritten by updating the blueprint.
 
 ## Development
 

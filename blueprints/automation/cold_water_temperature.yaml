@@ -7,7 +7,7 @@ blueprint:
     input_text helper (maximum length 255) for all persistent state. Create
     the two display sensors with the companion package or template blueprints. Temperatures
     must be in °C; configure the conversion from the cumulative meter to litres.
-    Use a dedicated helper for each automation instance. Version 1.2.0.
+    Use a dedicated helper for each automation instance. Version 1.2.1.
   domain: automation
   author: Andre Kuehne
   source_url: https://github.com/andrekuehne/ha_cold_water_temperature/blob/main/blueprints/automation/cold_water_temperature.yaml
@@ -85,12 +85,12 @@ blueprint:
             Three fresh observations, including the flushed reading, must span
             this time and stay within the temperature range. Keep shorter than
             the flow pause. A rejected window needs another volume increase.
-          default: 30
+          default: 90
           selector:
             number: {min: 10, max: 120, step: 1, unit_of_measurement: s, mode: box}
         flush_litres:
           name: Flush volume
-          default: 5
+          default: 15
           selector:
             number: {min: 0, max: 100, step: 0.1, unit_of_measurement: L, mode: box}
         settle_range:
@@ -115,7 +115,7 @@ blueprint:
           description: >-
             Hours since the last positive volume increase. Set 0 to disable.
             Unknown flow history starts guarded. Small draws do not disarm it.
-          default: 3
+          default: 1
           selector:
             number: {min: 0, max: 168, step: 0.5, unit_of_measurement: h, mode: box}
         guarded_flush_litres:
@@ -123,7 +123,7 @@ blueprint:
           description: >-
             Required volume within one water-use session while guarded.
             The effective threshold is never lower than the normal flush volume.
-          default: 10
+          default: 15
           selector:
             number: {min: 0, max: 500, step: 0.1, unit_of_measurement: L, mode: box}
         guarded_delay:
@@ -141,7 +141,7 @@ blueprint:
             Stable fresh-observation span after the guarded volume/time gates.
             Strict mode uses at least its own minimum span. Keep shorter than
             the flow pause so a completed draw can still be confirmed.
-          default: 30
+          default: 90
           selector:
             number: {min: 10, max: 600, step: 1, unit_of_measurement: s, mode: box}
     timing:
